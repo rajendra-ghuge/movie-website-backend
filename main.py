@@ -66,12 +66,14 @@ async def get_movie_credits(movie_id: int):
     return await get_tmdb_data(f"movie/{movie_id}/credits")
 
 @app.get("/proxy/movie/{movie_id}/similar")
-async def get_movie_similar(movie_id: int):
-    return await get_tmdb_data(f"movie/{movie_id}/similar")
+async def get_movie_similar(movie_id: int, request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"movie/{movie_id}/similar", params)
 
 @app.get("/proxy/movie/{movie_id}/recommendations")
-async def get_movie_recommendations(movie_id: int):
-    return await get_tmdb_data(f"movie/{movie_id}/recommendations")
+async def get_movie_recommendations(movie_id: int, request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"movie/{movie_id}/recommendations", params)
 
 @app.get("/proxy/tv/{tv_id}")
 async def get_tv_details(tv_id: int, request: Request):
@@ -79,12 +81,14 @@ async def get_tv_details(tv_id: int, request: Request):
     return await get_tmdb_data(f"tv/{tv_id}", params)
 
 @app.get("/proxy/tv/{tv_id}/recommendations")
-async def get_tv_recommendations(tv_id: int):
-    return await get_tmdb_data(f"tv/{tv_id}/recommendations")
+async def get_tv_recommendations(tv_id: int, request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"tv/{tv_id}/recommendations", params)
 
 @app.get("/proxy/tv/{tv_id}/season/{season_number}")
-async def get_tv_season_details(tv_id: int, season_number: int):
-    return await get_tmdb_data(f"tv/{tv_id}/season/{season_number}")
+async def get_tv_season_details(tv_id: int, season_number: int, request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"tv/{tv_id}/season/{season_number}", params)
 
 @app.get("/proxy/movie/{movie_id}/keywords")
 async def get_movie_keywords(movie_id: int):
@@ -95,8 +99,9 @@ async def get_tv_keywords(tv_id: int):
     return await get_tmdb_data(f"tv/{tv_id}/keywords")
 
 @app.get("/proxy/keyword/{keyword_id}/movies")
-async def get_keyword_movies(keyword_id: int):
-    return await get_tmdb_data(f"keyword/{keyword_id}/movies")
+async def get_keyword_movies(keyword_id: int, request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"keyword/{keyword_id}/movies", params)
 
 
 @app.get("/proxy/discover/movie")

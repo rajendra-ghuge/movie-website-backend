@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+pydantic
+pydantic-settings
+slowapi
+python-multipart
+gunicorn

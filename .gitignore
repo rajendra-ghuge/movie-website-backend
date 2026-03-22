@@ -1,0 +1,10 @@
+# Python related
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/

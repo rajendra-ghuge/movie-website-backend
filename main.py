@@ -108,6 +108,12 @@ async def get_keyword_movies(keyword_id: int, request: Request):
 async def discover_movies(request: Request):
     params = dict(request.query_params)
     
+    # Quality filters to avoid "garbage" results
+    if "include_adult" not in params:
+        params["include_adult"] = "false"
+    if "sort_by" not in params:
+        params["sort_by"] = "popularity.desc"
+
     # Handle certification for India if present
     cert_params = ["certification", "certification.lte", "certification.gte"]
     if any(p in params for p in cert_params):
@@ -126,11 +132,61 @@ async def discover_both(request: Request):
     params = dict(request.query_params)
     params["api_key"] = TMDB_API_KEY
     
+    # Create specific params for movie and tv to handle different naming conventions
+    movie_params = params.copy()
+    tv_params = params.copy()
+    
+    # Handle release date limits
+    if "primary_release_date.lte" in params and "first_air_date.lte" not in params:
+        tv_params["first_air_date.lte"] = params["primary_release_date.lte"]
+    if "first_air_date.lte" in params and "primary_release_date.lte" not in params:
+        movie_params["primary_release_date.lte"] = params["first_air_date.lte"]
+        
+    # Handle sorting
+    if params.get("sort_by") == "primary_release_date.desc":
+        tv_params["sort_by"] = "first_air_date.desc"
+    elif params.get("sort_by") == "first_air_date.desc":
+        movie_params["sort_by"] = "primary_release_date.desc"
+        
+    # with_release_type is movie specific, TV discovery uses different filters
+    if "with_release_type" in tv_params:
+        del tv_params["with_release_type"]
+
     async with httpx.AsyncClient() as client:
         try:
-            # Fetch both movie and tv discovery concurrently
-            movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=params, timeout=10.0)
-            tv_task = client.get(f"{TMDB_BASE_URL}/discover/tv", params=params, timeout=10.0)
+            # If filtering by cast, use person's tv_credits for TV
+            # (discover/tv does NOT support with_cast - it ignores it)
+            if "with_cast" in params:
+                person_id = params["with_cast"]
+                
+                movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params, timeout=10.0)
+                tv_task = client.get(f"{TMDB_BASE_URL}/person/{person_id}/tv_credits", params={"api_key": TMDB_API_KEY}, timeout=10.0)
+                
+                movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
+                movie_res.raise_for_status()
+                tv_res.raise_for_status()
+                
+                movie_data = movie_res.json()
+                tv_data = tv_res.json()
+                
+                # Get actual TV credits, filter for quality, sort by popularity
+                tv_results = [r for r in tv_data.get("cast", []) if r.get("poster_path")]
+                tv_results.sort(key=lambda x: x.get("popularity", 0), reverse=True)
+                tv_results = tv_results[:20]
+                
+                combined_results = movie_data.get("results", []) + tv_results
+                
+                merged_data = {
+                    "page": movie_data.get("page", 1),
+                    "results": combined_results,
+                    "total_results": movie_data.get("total_results", 0) + len(tv_results),
+                    "total_pages": movie_data.get("total_pages", 0)
+                }
+                return Response(content=json.dumps(merged_data), media_type="application/json")
+
+            # Standard both discovery (no cast filter)
+            movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params, timeout=10.0)
+            tv_task = client.get(f"{TMDB_BASE_URL}/discover/tv", params=tv_params, timeout=10.0)
             
             movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
             movie_res.raise_for_status()
@@ -138,13 +194,9 @@ async def discover_both(request: Request):
             
             movie_data = movie_res.json()
             tv_data = tv_res.json()
-            
-            # Merge results
+
             combined_results = movie_data.get("results", []) + tv_data.get("results", [])
-            
-            # Combine pagination data
-            # Since both return 20 results per page, combined returns 40.
-            # We'll just return it as a single page response.
+
             merged_data = {
                 "page": movie_data.get("page", 1),
                 "results": combined_results,

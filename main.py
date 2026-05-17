@@ -1,8 +1,9 @@
 import os
 import asyncio
 import json
+import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, BackgroundTasks
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from datetime import date
+import psycopg2
 
 load_dotenv()
 
@@ -220,22 +223,58 @@ async def get_trending(media_type: str, time_window: str, request: Request):
 
 @app.get("/proxy/image/{size}/{path:path}")
 async def proxy_image(size: str, path: str):
-    # sizes: original, w500, etc.
-    async with httpx.AsyncClient() as client:
-        image_url = f"{TMDB_IMAGE_BASE_URL}/{size}/{path}"
+    image_url = f"{TMDB_IMAGE_BASE_URL}/{size}/{path}"
+    
+    async def image_streamer():
         try:
-            response = await client.get(image_url, timeout=20.0)
-            response.raise_for_status()
-            img_data = response.content
-            return Response(content=img_data, media_type="image/jpeg", headers={
-                "Cache-Control": "public, max-age=31536000"
-            })
+            async with httpx.AsyncClient() as client:
+                async with client.stream("GET", image_url, timeout=20.0) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        yield chunk
         except Exception as e:
-            raise HTTPException(status_code=404, detail="Image not found")
+            logging.error(f"Image stream error: {e}")
+            
+    return StreamingResponse(
+        image_streamer(), 
+        media_type="image/jpeg", 
+        headers={"Cache-Control": "public, max-age=31536000"}
+    )
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def save_visit_to_db(uid: str, visit_date: date):
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        
+        cur.execute("""
+            INSERT INTO daily_visits (uid, visit_date, last_visited_at) 
+            VALUES (%s, %s, CURRENT_TIMESTAMP) 
+            ON CONFLICT (uid, visit_date) 
+            DO UPDATE SET last_visited_at = CURRENT_TIMESTAMP;
+        """, (uid, visit_date))
+        
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Analytics Database error: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+@app.get("/proxy/stats/visit")
+async def record_visit(uid: str, background_tasks: BackgroundTasks):
+    background_tasks.add_task(save_visit_to_db, uid, date.today())
+    return {"status": "ok", "message": "Visit recorded"}
 
 if __name__ == "__main__":
     import uvicorn

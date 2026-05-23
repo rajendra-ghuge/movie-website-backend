@@ -8,3 +8,4 @@ slowapi
 python-multipart
 gunicorn
 psycopg2-binary
+cachetools

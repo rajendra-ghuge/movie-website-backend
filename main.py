@@ -2,8 +2,7 @@ import os
 import asyncio
 import json
 import logging
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -13,6 +12,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from datetime import date
 import psycopg2
+from cachetools import TTLCache
 
 load_dotenv()
 
@@ -21,8 +21,26 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 TMDB_BASE_URL = os.getenv("TMDB_BASE_URL", "https://api.themoviedb.org/3")
 TMDB_IMAGE_BASE_URL = os.getenv("TMDB_IMAGE_BASE_URL", "https://image.tmdb.org/t/p")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip()]
+CORS_ALLOW_ALL = "*" in CORS_ORIGINS
+REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+json_cache = TTLCache(maxsize=300, ttl=300)
+tmdb_client: httpx.AsyncClient | None = None
 
 app = FastAPI(title="movie website  Backend")
+
+
+@app.on_event("startup")
+async def startup_event():
+    global tmdb_client
+    tmdb_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if tmdb_client:
+        await tmdb_client.aclose()
 
 # Rate Limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -32,28 +50,51 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for deployment initially
-    allow_credentials=True,
+    allow_origins=["*"] if CORS_ALLOW_ALL else CORS_ORIGINS,
+    allow_credentials=not CORS_ALLOW_ALL,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def make_cache_key(path: str, params: dict):
+    return path, tuple(sorted((str(key), str(value)) for key, value in params.items()))
 
 
 async def get_tmdb_data(path: str, params: dict = None):
     if params is None:
         params = {}
     params["api_key"] = TMDB_API_KEY
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(f"{TMDB_BASE_URL}/{path}", params=params, timeout=10.0)
-            response.raise_for_status()
-            data = response.content
-            return Response(content=data, media_type="application/json")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=str(e))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+
+    cache_key = make_cache_key(path, params)
+    cached = json_cache.get(cache_key)
+    if cached:
+        return Response(
+            content=cached,
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"}
+        )
+
+    try:
+        should_close_client = tmdb_client is None
+        client = tmdb_client or httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+        response = await client.get(f"{TMDB_BASE_URL}/{path}", params=params)
+        response.raise_for_status()
+        data = response.content
+        json_cache[cache_key] = data
+        return Response(
+            content=data,
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"}
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Upstream request failed")
+    except Exception:
+        logging.exception("TMDB request failed")
+        raise HTTPException(status_code=500, detail="Backend request failed")
+    finally:
+        if 'client' in locals() and should_close_client:
+            await client.aclose()
 
 @app.get("/proxy/movie/{movie_id}")
 async def get_movie_details(movie_id: int, request: Request):
@@ -155,42 +196,26 @@ async def discover_both(request: Request):
     if "with_release_type" in tv_params:
         del tv_params["with_release_type"]
 
-    async with httpx.AsyncClient() as client:
-        try:
-            # If filtering by cast, use person's tv_credits for TV
-            # (discover/tv does NOT support with_cast - it ignores it)
-            if "with_cast" in params:
-                person_id = params["with_cast"]
-                
-                movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params, timeout=10.0)
-                tv_task = client.get(f"{TMDB_BASE_URL}/person/{person_id}/tv_credits", params={"api_key": TMDB_API_KEY}, timeout=10.0)
-                
-                movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
-                movie_res.raise_for_status()
-                tv_res.raise_for_status()
-                
-                movie_data = movie_res.json()
-                tv_data = tv_res.json()
-                
-                # Get actual TV credits, filter for quality, sort by popularity
-                tv_results = [r for r in tv_data.get("cast", []) if r.get("poster_path")]
-                tv_results.sort(key=lambda x: x.get("popularity", 0), reverse=True)
-                tv_results = tv_results[:20]
-                
-                combined_results = movie_data.get("results", []) + tv_results
-                
-                merged_data = {
-                    "page": movie_data.get("page", 1),
-                    "results": combined_results,
-                    "total_results": movie_data.get("total_results", 0) + len(tv_results),
-                    "total_pages": movie_data.get("total_pages", 0)
-                }
-                return Response(content=json.dumps(merged_data), media_type="application/json")
+    cache_key = make_cache_key("discover/both", params)
+    cached = json_cache.get(cache_key)
+    if cached:
+        return Response(
+            content=cached,
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"}
+        )
 
-            # Standard both discovery (no cast filter)
-            movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params, timeout=10.0)
-            tv_task = client.get(f"{TMDB_BASE_URL}/discover/tv", params=tv_params, timeout=10.0)
+    try:
+        should_close_client = tmdb_client is None
+        client = tmdb_client or httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+        # If filtering by cast, use person's tv_credits for TV
+        # (discover/tv does NOT support with_cast - it ignores it)
+        if "with_cast" in params:
+            person_id = params["with_cast"]
             
+            movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params)
+            tv_task = client.get(f"{TMDB_BASE_URL}/person/{person_id}/tv_credits", params={"api_key": TMDB_API_KEY})
+
             movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
             movie_res.raise_for_status()
             tv_res.raise_for_status()
@@ -198,18 +223,54 @@ async def discover_both(request: Request):
             movie_data = movie_res.json()
             tv_data = tv_res.json()
 
-            combined_results = movie_data.get("results", []) + tv_data.get("results", [])
+            # Get actual TV credits, filter for quality, sort by popularity
+            tv_results = [r for r in tv_data.get("cast", []) if r.get("poster_path")]
+            tv_results.sort(key=lambda x: x.get("popularity", 0), reverse=True)
+            tv_results = tv_results[:20]
+
+            combined_results = movie_data.get("results", []) + tv_results
 
             merged_data = {
                 "page": movie_data.get("page", 1),
                 "results": combined_results,
-                "total_results": movie_data.get("total_results", 0) + tv_data.get("total_results", 0),
-                "total_pages": max(movie_data.get("total_pages", 0), tv_data.get("total_pages", 0))
+                "total_results": movie_data.get("total_results", 0) + len(tv_results),
+                "total_pages": movie_data.get("total_pages", 0)
             }
-            
-            return Response(content=json.dumps(merged_data), media_type="application/json")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            data = json.dumps(merged_data)
+            json_cache[cache_key] = data
+            return Response(content=data, media_type="application/json", headers={"Cache-Control": "public, max-age=300"})
+
+        # Standard both discovery (no cast filter)
+        movie_task = client.get(f"{TMDB_BASE_URL}/discover/movie", params=movie_params)
+        tv_task = client.get(f"{TMDB_BASE_URL}/discover/tv", params=tv_params)
+
+        movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
+        movie_res.raise_for_status()
+        tv_res.raise_for_status()
+
+        movie_data = movie_res.json()
+        tv_data = tv_res.json()
+
+        combined_results = movie_data.get("results", []) + tv_data.get("results", [])
+
+        merged_data = {
+            "page": movie_data.get("page", 1),
+            "results": combined_results,
+            "total_results": movie_data.get("total_results", 0) + tv_data.get("total_results", 0),
+            "total_pages": max(movie_data.get("total_pages", 0), tv_data.get("total_pages", 0))
+        }
+
+        data = json.dumps(merged_data)
+        json_cache[cache_key] = data
+        return Response(content=data, media_type="application/json", headers={"Cache-Control": "public, max-age=300"})
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Upstream request failed")
+    except Exception:
+        logging.exception("Combined discovery failed")
+        raise HTTPException(status_code=500, detail="Backend request failed")
+    finally:
+        if 'client' in locals() and should_close_client:
+            await client.aclose()
 
 @app.get("/proxy/search/multi")
 async def search_multi(request: Request):
@@ -227,13 +288,13 @@ async def proxy_image(size: str, path: str):
     
     async def image_streamer():
         try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream("GET", image_url, timeout=20.0) as response:
+            async with httpx.AsyncClient(timeout=IMAGE_TIMEOUT) as client:
+                async with client.stream("GET", image_url) as response:
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes(chunk_size=8192):
                         yield chunk
-        except Exception as e:
-            logging.error(f"Image stream error: {e}")
+        except Exception:
+            logging.exception("Image stream error")
             
     return StreamingResponse(
         image_streamer(), 
@@ -248,7 +309,24 @@ async def health_check():
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def save_visit_to_db(uid: str, visit_date: date):
+
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+
+    return request.client.host if request.client else ""
+
+
+def save_visit_to_db(uid: str, visit_date: date, ip_address: str):
+    if not DATABASE_URL:
+        logging.error("Analytics Database error: DATABASE_URL is not configured")
+        return
+
     conn = None
     cur = None
     try:
@@ -256,11 +334,13 @@ def save_visit_to_db(uid: str, visit_date: date):
         cur = conn.cursor()
         
         cur.execute("""
-            INSERT INTO daily_visits (uid, visit_date, last_visited_at) 
-            VALUES (%s, %s, CURRENT_TIMESTAMP) 
+            INSERT INTO daily_visits (uid, visit_date, ip_address, last_visited_at) 
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP) 
             ON CONFLICT (uid, visit_date) 
-            DO UPDATE SET last_visited_at = CURRENT_TIMESTAMP;
-        """, (uid, visit_date))
+            DO UPDATE SET
+                ip_address = EXCLUDED.ip_address,
+                last_visited_at = CURRENT_TIMESTAMP;
+        """, (uid, visit_date, ip_address))
         
         conn.commit()
     except Exception as e:
@@ -272,8 +352,8 @@ def save_visit_to_db(uid: str, visit_date: date):
             conn.close()
 
 @app.get("/proxy/stats/visit")
-async def record_visit(uid: str, background_tasks: BackgroundTasks):
-    background_tasks.add_task(save_visit_to_db, uid, date.today())
+async def record_visit(uid: str, request: Request, background_tasks: BackgroundTasks):
+    background_tasks.add_task(save_visit_to_db, uid, date.today(), get_client_ip(request))
     return {"status": "ok", "message": "Visit recorded"}
 
 if __name__ == "__main__":

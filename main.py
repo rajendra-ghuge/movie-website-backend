@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from typing import Any
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,7 @@ CORS_ALLOW_ALL = "*" in CORS_ORIGINS
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 DOWNLOAD_API_BASE_URL = os.getenv("DOWNLOAD_API_BASE_URL", "https://example.com/api").rstrip("/")
+DOWNLOAD_REFERER = os.getenv("DOWNLOAD_REFERER", "https://example.com/")
 json_cache = TTLCache(maxsize=300, ttl=300)
 tmdb_client: httpx.AsyncClient | None = None
 
@@ -341,10 +343,45 @@ def find_first_list(data: Any, keys: set[str]):
     return None
 
 
+def build_download_referer(media_type: str, tmdb_id: int, season: int | None = None, episode: int | None = None):
+    referer_base = DOWNLOAD_REFERER.rstrip("/")
+    if media_type == "tv":
+        return f"{referer_base}/tv/{tmdb_id}/{season}/{episode}"
+    return f"{referer_base}/movie/{tmdb_id}"
+
+
+def get_origin_from_referer(referer: str):
+    parsed = urlparse(referer)
+    if not parsed.scheme or not parsed.netloc:
+        return referer.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def extract_download_data(data: dict[str, Any]):
-    payload = data.get("extractData", {}).get("data", {}).get("data", {})
+    if not isinstance(data, dict):
+        logging.error("Download upstream returned non-object JSON: %r", data)
+        return {"downloads": [], "subtitles": [], "raw": data}
+
+    extract_data = data.get("extractData") or {}
+    data_wrapper = extract_data.get("data") if isinstance(extract_data, dict) else {}
+    payload = data_wrapper.get("data") if isinstance(data_wrapper, dict) else {}
+    if not isinstance(payload, dict):
+        logging.error("Download upstream returned invalid payload: %r", data)
+        payload = {}
     downloads = find_first_list(payload, {"downloads", "downloadlinks"}) or []
     subtitles = find_first_list(payload, {"subtitles", "subtitlesdata", "subtitle", "captions", "tracks"}) or []
+    if not downloads:
+        mkv_data = data.get("mkvData") or {}
+        mkv_files = mkv_data.get("files") if isinstance(mkv_data, dict) else []
+        if isinstance(mkv_files, list):
+            downloads = [
+                {
+                    **item,
+                    "quality": item.get("quality") or item.get("resolution") or "MKV",
+                }
+                for item in mkv_files
+                if isinstance(item, dict)
+            ]
 
     if isinstance(downloads, dict):
         downloads = list(downloads.values())
@@ -372,27 +409,44 @@ async def get_download_links(payload: DownloadLinksRequest):
         request_payload["season"] = int(payload.season)
         request_payload["episode"] = int(payload.episode)
 
+    download_referer = build_download_referer(media_type, payload.tmdbId, payload.season, payload.episode)
+    download_origin = get_origin_from_referer(download_referer)
+    download_headers = {
+        "Content-Type": "application/json",
+        "x-request-token": "",
+        "Referer": download_referer,
+        "Origin": download_origin,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            token_response = await client.get(f"{DOWNLOAD_API_BASE_URL}/get-token")
+            token_response = await client.get(
+                f"{DOWNLOAD_API_BASE_URL}/get-token",
+                headers={key: value for key, value in download_headers.items() if key not in {"Content-Type", "x-request-token"}},
+            )
             token_response.raise_for_status()
             token = token_response.json().get("t")
             if not token:
                 raise HTTPException(status_code=502, detail="Download token missing")
 
+            download_headers["x-request-token"] = token
             link_response = await client.post(
                 f"{DOWNLOAD_API_BASE_URL}/download-proxy",
-                headers={"Content-Type": "application/json", "x-request-token": token},
+                headers=download_headers,
                 json=request_payload,
             )
+            logging.info("Download proxy status=%s body=%s", link_response.status_code, link_response.text[:1000])
             link_response.raise_for_status()
             return extract_download_data(link_response.json())
     except HTTPException:
         raise
     except httpx.HTTPStatusError as e:
+        logging.error("Download upstream HTTP error status=%s body=%s", e.response.status_code, e.response.text[:1000])
         raise HTTPException(status_code=e.response.status_code, detail="Download upstream request failed")
-    except Exception:
-        logging.exception("Download link request failed")
+    except Exception as e:
+        logging.exception("Download link request failed: %s", e)
         raise HTTPException(status_code=500, detail="Download request failed")
 
 

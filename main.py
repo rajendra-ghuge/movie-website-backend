@@ -2,9 +2,11 @@ import os
 import asyncio
 import json
 import logging
+from typing import Any
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -20,15 +22,27 @@ load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 TMDB_BASE_URL = os.getenv("TMDB_BASE_URL", "https://api.themoviedb.org/3")
 TMDB_IMAGE_BASE_URL = os.getenv("TMDB_IMAGE_BASE_URL", "https://image.tmdb.org/t/p")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+CORS_ORIGINS = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
 CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip()]
 CORS_ALLOW_ALL = "*" in CORS_ORIGINS
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+DOWNLOAD_API_BASE_URL = os.getenv("DOWNLOAD_API_BASE_URL", "https://example.com/api").rstrip("/")
 json_cache = TTLCache(maxsize=300, ttl=300)
 tmdb_client: httpx.AsyncClient | None = None
 
 app = FastAPI(title="movie website  Backend")
+
+
+class DownloadLinksRequest(BaseModel):
+    tmdbId: int
+    type: str
+    season: int | None = None
+    episode: int | None = None
+    title: str | None = None
 
 
 @app.on_event("startup")
@@ -305,6 +319,81 @@ async def proxy_image(size: str, path: str):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+def find_first_list(data: Any, keys: set[str]):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key.lower() in keys:
+                if isinstance(value, list):
+                    return value
+                if isinstance(value, dict):
+                    return list(value.values())
+        for value in data.values():
+            found = find_first_list(value, keys)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = find_first_list(value, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_download_data(data: dict[str, Any]):
+    payload = data.get("extractData", {}).get("data", {}).get("data", {})
+    downloads = find_first_list(payload, {"downloads", "downloadlinks"}) or []
+    subtitles = find_first_list(payload, {"subtitles", "subtitlesdata", "subtitle", "captions", "tracks"}) or []
+
+    if isinstance(downloads, dict):
+        downloads = list(downloads.values())
+    if isinstance(subtitles, dict):
+        subtitles = list(subtitles.values())
+
+    return {
+        "downloads": downloads if isinstance(downloads, list) else [],
+        "subtitles": subtitles if isinstance(subtitles, list) else [],
+        "raw": data,
+    }
+
+
+@app.post("/downloads/links")
+@app.post("/proxy/downloads/links")
+async def get_download_links(payload: DownloadLinksRequest):
+    media_type = payload.type
+    if media_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=400, detail="type must be movie or tv")
+    if media_type == "tv" and (payload.season is None or payload.episode is None):
+        raise HTTPException(status_code=400, detail="season and episode are required for tv")
+
+    request_payload = {"type": media_type, "tmdbId": int(payload.tmdbId)}
+    if media_type == "tv":
+        request_payload["season"] = int(payload.season)
+        request_payload["episode"] = int(payload.episode)
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            token_response = await client.get(f"{DOWNLOAD_API_BASE_URL}/get-token")
+            token_response.raise_for_status()
+            token = token_response.json().get("t")
+            if not token:
+                raise HTTPException(status_code=502, detail="Download token missing")
+
+            link_response = await client.post(
+                f"{DOWNLOAD_API_BASE_URL}/download-proxy",
+                headers={"Content-Type": "application/json", "x-request-token": token},
+                json=request_payload,
+            )
+            link_response.raise_for_status()
+            return extract_download_data(link_response.json())
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Download upstream request failed")
+    except Exception:
+        logging.exception("Download link request failed")
+        raise HTTPException(status_code=500, detail="Download request failed")
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")

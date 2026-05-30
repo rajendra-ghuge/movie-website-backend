@@ -2,22 +2,26 @@ import os
 import asyncio
 import json
 import logging
-from typing import Any
-from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import Response, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import httpx
-from dotenv import load_dotenv
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from datetime import date
+
+import httpx
 import psycopg2
 from cachetools import TTLCache
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.extension import _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Configuration
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
@@ -31,20 +35,11 @@ CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip()]
 CORS_ALLOW_ALL = "*" in CORS_ORIGINS
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
-DOWNLOAD_API_BASE_URL = os.getenv("DOWNLOAD_API_BASE_URL", "https://example.com/api").rstrip("/")
-DOWNLOAD_REFERER = os.getenv("DOWNLOAD_REFERER", "https://example.com/")
+DATABASE_URL = os.getenv("DATABASE_URL")
 json_cache = TTLCache(maxsize=300, ttl=300)
 tmdb_client: httpx.AsyncClient | None = None
 
 app = FastAPI(title="movie website  Backend")
-
-
-class DownloadLinksRequest(BaseModel):
-    tmdbId: int
-    type: str
-    season: int | None = None
-    episode: int | None = None
-    title: str | None = None
 
 
 @app.on_event("startup")
@@ -80,6 +75,8 @@ def make_cache_key(path: str, params: dict):
 async def get_tmdb_data(path: str, params: dict = None):
     if params is None:
         params = {}
+    if "certification_country" not in params:
+        params["certification_country"] = "IN"
     params["api_key"] = TMDB_API_KEY
 
     cache_key = make_cache_key(path, params)
@@ -111,6 +108,11 @@ async def get_tmdb_data(path: str, params: dict = None):
     finally:
         if 'client' in locals() and should_close_client:
             await client.aclose()
+
+@app.get("/proxy/movie/now_playing")
+async def get_now_playing_movies(request: Request):
+    params = dict(request.query_params)
+    return await get_tmdb_data("movie/now_playing", params)
 
 @app.get("/proxy/movie/{movie_id}")
 async def get_movie_details(movie_id: int, request: Request):
@@ -158,6 +160,14 @@ async def get_movie_keywords(movie_id: int):
 async def get_tv_keywords(tv_id: int):
     return await get_tmdb_data(f"tv/{tv_id}/keywords")
 
+@app.get("/proxy/genre/{media_type}/list")
+async def get_genres(media_type: str, request: Request):
+    if media_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=400, detail="media_type must be 'movie' or 'tv'")
+
+    params = dict(request.query_params)
+    return await get_tmdb_data(f"genre/{media_type}/list", params)
+
 @app.get("/proxy/keyword/{keyword_id}/movies")
 async def get_keyword_movies(keyword_id: int, request: Request):
     params = dict(request.query_params)
@@ -174,12 +184,6 @@ async def discover_movies(request: Request):
     if "sort_by" not in params:
         params["sort_by"] = "popularity.desc"
 
-    # Handle certification for India if present
-    cert_params = ["certification", "certification.lte", "certification.gte"]
-    if any(p in params for p in cert_params):
-        if "certification_country" not in params:
-            params["certification_country"] = "IN"
-            
     return await get_tmdb_data("discover/movie", params)
 
 @app.get("/proxy/discover/tv")
@@ -190,6 +194,8 @@ async def discover_tv(request: Request):
 @app.get("/proxy/discover/both")
 async def discover_both(request: Request):
     params = dict(request.query_params)
+    if "certification_country" not in params:
+        params["certification_country"] = "IN"
     params["api_key"] = TMDB_API_KEY
     
     # Create specific params for movie and tv to handle different naming conventions
@@ -321,136 +327,6 @@ async def proxy_image(size: str, path: str):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
-
-
-def find_first_list(data: Any, keys: set[str]):
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key.lower() in keys:
-                if isinstance(value, list):
-                    return value
-                if isinstance(value, dict):
-                    return list(value.values())
-        for value in data.values():
-            found = find_first_list(value, keys)
-            if found is not None:
-                return found
-    elif isinstance(data, list):
-        for value in data:
-            found = find_first_list(value, keys)
-            if found is not None:
-                return found
-    return None
-
-
-def build_download_referer(media_type: str, tmdb_id: int, season: int | None = None, episode: int | None = None):
-    referer_base = DOWNLOAD_REFERER.rstrip("/")
-    if media_type == "tv":
-        return f"{referer_base}/tv/{tmdb_id}/{season}/{episode}"
-    return f"{referer_base}/movie/{tmdb_id}"
-
-
-def get_origin_from_referer(referer: str):
-    parsed = urlparse(referer)
-    if not parsed.scheme or not parsed.netloc:
-        return referer.rstrip("/")
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def extract_download_data(data: dict[str, Any]):
-    if not isinstance(data, dict):
-        logging.error("Download upstream returned non-object JSON: %r", data)
-        return {"downloads": [], "subtitles": [], "raw": data}
-
-    extract_data = data.get("extractData") or {}
-    data_wrapper = extract_data.get("data") if isinstance(extract_data, dict) else {}
-    payload = data_wrapper.get("data") if isinstance(data_wrapper, dict) else {}
-    if not isinstance(payload, dict):
-        logging.error("Download upstream returned invalid payload: %r", data)
-        payload = {}
-    downloads = find_first_list(payload, {"downloads", "downloadlinks"}) or []
-    subtitles = find_first_list(payload, {"subtitles", "subtitlesdata", "subtitle", "captions", "tracks"}) or []
-    if not downloads:
-        mkv_data = data.get("mkvData") or {}
-        mkv_files = mkv_data.get("files") if isinstance(mkv_data, dict) else []
-        if isinstance(mkv_files, list):
-            downloads = [
-                {
-                    **item,
-                    "quality": item.get("quality") or item.get("resolution") or "MKV",
-                }
-                for item in mkv_files
-                if isinstance(item, dict)
-            ]
-
-    if isinstance(downloads, dict):
-        downloads = list(downloads.values())
-    if isinstance(subtitles, dict):
-        subtitles = list(subtitles.values())
-
-    return {
-        "downloads": downloads if isinstance(downloads, list) else [],
-        "subtitles": subtitles if isinstance(subtitles, list) else [],
-        "raw": data,
-    }
-
-
-@app.post("/downloads/links")
-@app.post("/proxy/downloads/links")
-async def get_download_links(payload: DownloadLinksRequest):
-    media_type = payload.type
-    if media_type not in {"movie", "tv"}:
-        raise HTTPException(status_code=400, detail="type must be movie or tv")
-    if media_type == "tv" and (payload.season is None or payload.episode is None):
-        raise HTTPException(status_code=400, detail="season and episode are required for tv")
-
-    request_payload = {"type": media_type, "tmdbId": int(payload.tmdbId)}
-    if media_type == "tv":
-        request_payload["season"] = int(payload.season)
-        request_payload["episode"] = int(payload.episode)
-
-    download_referer = build_download_referer(media_type, payload.tmdbId, payload.season, payload.episode)
-    download_origin = get_origin_from_referer(download_referer)
-    download_headers = {
-        "Content-Type": "application/json",
-        "x-request-token": "",
-        "Referer": download_referer,
-        "Origin": download_origin,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            token_response = await client.get(
-                f"{DOWNLOAD_API_BASE_URL}/get-token",
-                headers={key: value for key, value in download_headers.items() if key not in {"Content-Type", "x-request-token"}},
-            )
-            token_response.raise_for_status()
-            token = token_response.json().get("t")
-            if not token:
-                raise HTTPException(status_code=502, detail="Download token missing")
-
-            download_headers["x-request-token"] = token
-            link_response = await client.post(
-                f"{DOWNLOAD_API_BASE_URL}/download-proxy",
-                headers=download_headers,
-                json=request_payload,
-            )
-            logging.info("Download proxy status=%s body=%s", link_response.status_code, link_response.text[:1000])
-            link_response.raise_for_status()
-            return extract_download_data(link_response.json())
-    except HTTPException:
-        raise
-    except httpx.HTTPStatusError as e:
-        logging.error("Download upstream HTTP error status=%s body=%s", e.response.status_code, e.response.text[:1000])
-        raise HTTPException(status_code=e.response.status_code, detail="Download upstream request failed")
-    except Exception as e:
-        logging.exception("Download link request failed: %s", e)
-        raise HTTPException(status_code=500, detail="Download request failed")
-
-
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def get_client_ip(request: Request) -> str:

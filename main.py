@@ -189,6 +189,8 @@ async def discover_movies(request: Request):
 @app.get("/proxy/discover/tv")
 async def discover_tv(request: Request):
     params = dict(request.query_params)
+    if "sort_by" not in params:
+        params["sort_by"] = "first_air_date.desc"
     return await get_tmdb_data("discover/tv", params)
 
 @app.get("/proxy/discover/both")
@@ -201,6 +203,10 @@ async def discover_both(request: Request):
     # Create specific params for movie and tv to handle different naming conventions
     movie_params = params.copy()
     tv_params = params.copy()
+    movie_sort_by = movie_params.pop("movie_sort_by", None)
+    tv_sort_by = tv_params.pop("tv_sort_by", None)
+    movie_params.pop("tv_sort_by", None)
+    tv_params.pop("movie_sort_by", None)
     
     # Handle release date limits
     if "primary_release_date.lte" in params and "first_air_date.lte" not in params:
@@ -213,6 +219,13 @@ async def discover_both(request: Request):
         tv_params["sort_by"] = "first_air_date.desc"
     elif params.get("sort_by") == "first_air_date.desc":
         movie_params["sort_by"] = "primary_release_date.desc"
+    elif params.get("sort_by") == "popularity.desc" and params.get("with_original_language") == "hi":
+        tv_params["sort_by"] = "first_air_date.desc"
+
+    if movie_sort_by:
+        movie_params["sort_by"] = movie_sort_by
+    if tv_sort_by:
+        tv_params["sort_by"] = tv_sort_by
         
     # with_release_type is movie specific, TV discovery uses different filters
     if "with_release_type" in tv_params:

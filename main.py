@@ -219,8 +219,7 @@ async def discover_both(request: Request):
         tv_params["sort_by"] = "first_air_date.desc"
     elif params.get("sort_by") == "first_air_date.desc":
         movie_params["sort_by"] = "primary_release_date.desc"
-    elif params.get("sort_by") == "popularity.desc" and params.get("with_original_language") == "hi":
-        tv_params["sort_by"] = "first_air_date.desc"
+    # Allow popularity.desc for TV shows so top-rated web series appear instead of daily serial air dates
 
     if movie_sort_by:
         movie_params["sort_by"] = movie_sort_by

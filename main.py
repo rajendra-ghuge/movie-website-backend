@@ -230,6 +230,12 @@ async def discover_both(request: Request):
     if "with_release_type" in tv_params:
         del tv_params["with_release_type"]
 
+    # Filter out low-vote daily soaps/serials from TV shows while keeping new movies intact
+    if "vote_count.gte" not in params:
+        tv_params["vote_count.gte"] = 15
+    if "without_genres" not in params:
+        tv_params["without_genres"] = "10766,10764,10767,10763"
+
     cache_key = make_cache_key("discover/both", params)
     cached = json_cache.get(cache_key)
     if cached:

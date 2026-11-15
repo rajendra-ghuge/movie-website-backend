@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import json
 import logging
@@ -16,12 +17,18 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.extension import _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 
+
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+# Silence noisy libraries and access logs
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
 
 # Configuration
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
@@ -34,24 +41,45 @@ CORS_ORIGINS = os.getenv(
 CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip()]
 CORS_ALLOW_ALL = "*" in CORS_ORIGINS
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
-IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+IMAGE_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 DATABASE_URL = os.getenv("DATABASE_URL")
 json_cache = TTLCache(maxsize=300, ttl=300)
 tmdb_client: httpx.AsyncClient | None = None
+image_client: httpx.AsyncClient | None = None
+
+def get_image_client() -> httpx.AsyncClient:
+    global image_client
+    if image_client is None or image_client.is_closed:
+        limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=120.0)
+        image_client = httpx.AsyncClient(
+            limits=limits,
+            timeout=IMAGE_TIMEOUT
+        )
+    return image_client
 
 app = FastAPI(title="movie website  Backend")
 
 
 @app.on_event("startup")
 async def startup_event():
-    global tmdb_client
+    logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
+    logging.getLogger("httpx").setLevel(logging.ERROR)
+    logging.getLogger("httpcore").setLevel(logging.ERROR)
+    global tmdb_client, image_client
     tmdb_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=120.0)
+    image_client = httpx.AsyncClient(
+        limits=limits,
+        timeout=IMAGE_TIMEOUT
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     if tmdb_client:
         await tmdb_client.aclose()
+    if image_client:
+        await image_client.aclose()
 
 # Rate Limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -66,6 +94,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 def make_cache_key(path: str, params: dict):
@@ -317,6 +346,49 @@ async def search_multi(request: Request):
     params = dict(request.query_params)
     return await get_tmdb_data("search/multi", params)
 
+@app.get("/proxy/find/{external_id}")
+async def find_by_external_id(external_id: str, request: Request):
+    """Finds TMDB media by external ID (e.g. IMDb ID tt0111161)."""
+    params = dict(request.query_params)
+    params.setdefault("external_source", "imdb_id")
+    return await get_tmdb_data(f"find/{external_id}", params)
+
+@app.get("/convert/imdb/{imdb_id}")
+async def convert_imdb_to_tmdb(imdb_id: str, season: int = 1, episode: int = 1):
+    """Converts IMDb ID to TMDB ID and returns the corresponding Play4U iframe embed URL."""
+    res = await get_tmdb_data(f"find/{imdb_id}", {"external_source": "imdb_id"})
+    if hasattr(res, "body"):
+        data = json.loads(res.body.decode("utf-8"))
+        movie_results = data.get("movie_results", [])
+        if movie_results:
+            m = movie_results[0]
+            tmdb_id = m.get("id")
+            return {
+                "success": True,
+                "media_type": "movie",
+                "imdb_id": imdb_id,
+                "tmdb_id": tmdb_id,
+                "title": m.get("title"),
+                "embed_url": f"https://play4u.org/watch/{imdb_id}?embed=1"
+            }
+        tv_results = data.get("tv_results", [])
+        if tv_results:
+            tv = tv_results[0]
+            tmdb_id = tv.get("id")
+            s_pad = f"{int(season):02d}"
+            ep_pad = f"{int(episode):02d}"
+            return {
+                "success": True,
+                "media_type": "tv",
+                "imdb_id": imdb_id,
+                "tmdb_id": tmdb_id,
+                "title": tv.get("name"),
+                "season": season,
+                "episode": episode,
+                "embed_url": f"https://play4u.org/series/{imdb_id}/s-{s_pad}/ep-{ep_pad}?embed=1"
+            }
+    raise HTTPException(status_code=404, detail="TMDB ID not found for given IMDb ID")
+
 @app.get("/proxy/trending/{media_type}/{time_window}")
 async def get_trending(media_type: str, time_window: str, request: Request):
     params = dict(request.query_params)
@@ -328,19 +400,234 @@ async def proxy_image(size: str, path: str):
     
     async def image_streamer():
         try:
-            async with httpx.AsyncClient(timeout=IMAGE_TIMEOUT) as client:
-                async with client.stream("GET", image_url) as response:
-                    response.raise_for_status()
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        yield chunk
-        except Exception:
-            logging.exception("Image stream error")
+            client = get_image_client()
+            async with client.stream("GET", image_url) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    yield chunk
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            logging.error(f"Image stream timeout for {path}: {e}")
+        except Exception as e:
+            logging.error(f"Image stream error for {path}: {e}")
             
     return StreamingResponse(
         image_streamer(), 
         media_type="image/jpeg", 
         headers={"Cache-Control": "public, max-age=31536000"}
     )
+
+# ==============================================================================
+# Direct Stream Resolvers (Play4U Embed for S0)
+# ==============================================================================
+
+PLAYDRIVE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://play4u.org/",
+    "Accept": "application/json, text/html, */*"
+}
+
+async def get_movie_stream(tmdb_id: str) -> dict | None:
+    """
+    Checks if Movie is available on Play4U by TMDB ID, and returns the direct Play4U embed URL.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            # 1. Search Play4U by TMDB ID
+            search_resp = await client.get(
+                f"https://play4u.org/api/search.php?q={tmdb_id}&per_page=5", 
+                headers=PLAYDRIVE_HEADERS
+            )
+            item = None
+            if search_resp.status_code == 200:
+                for it in search_resp.json().get("items", []):
+                    if str(it.get("tmdb_id")) == str(tmdb_id):
+                        item = it
+                        break
+                if not item and search_resp.json().get("items"):
+                    item = search_resp.json()["items"][0]
+
+            # Fallback to TMDB details if not matched directly
+            if not item:
+                try:
+                    tmdb_resp = await get_tmdb_data(f"movie/{tmdb_id}")
+                    if tmdb_resp and hasattr(tmdb_resp, 'body'):
+                        meta = json.loads(tmdb_resp.body.decode('utf-8'))
+                        imdb_id_tmdb = meta.get("imdb_id")
+                        title_tmdb = meta.get("title")
+                        if imdb_id_tmdb:
+                            search_resp = await client.get(
+                                f"https://play4u.org/api/search.php?q={imdb_id_tmdb}&per_page=5", 
+                                headers=PLAYDRIVE_HEADERS
+                            )
+                            if search_resp.status_code == 200 and search_resp.json().get("items"):
+                                item = search_resp.json()["items"][0]
+                        if not item and title_tmdb:
+                            clean_title = re.sub(r'[^a-zA-Z0-9\s]', ' ', title_tmdb).strip()
+                            search_resp = await client.get(
+                                f"https://play4u.org/api/search.php?q={clean_title}&per_page=5", 
+                                headers=PLAYDRIVE_HEADERS
+                            )
+                            if search_resp.status_code == 200 and search_resp.json().get("items"):
+                                item = search_resp.json()["items"][0]
+                except Exception as e:
+                    logging.error(f"Error querying TMDB fallback for movie {tmdb_id}: {e}")
+
+            if not item:
+                return None
+
+            imdb_id = item.get("imdb_id")
+            target_url = f"https://play4u.org/watch/{imdb_id}" if imdb_id else f"https://play4u.org{item.get('watch')}"
+
+            # Verify watch page is live on Play4U
+            page_resp = await client.get(target_url, headers=PLAYDRIVE_HEADERS)
+            if page_resp.status_code != 200:
+                return None
+
+            embed_target = f"{target_url}?embed=1"
+            return {
+                "success": True,
+                "media_type": "movie",
+                "tmdb_id": tmdb_id,
+                "imdb_id": imdb_id,
+                "title": item.get("title"),
+                "embed_url": embed_target,
+                "stream_url": embed_target
+            }
+    except Exception as e:
+        logging.error(f"Error resolving movie stream for TMDB ID {tmdb_id}: {e}")
+        return None
+
+
+async def get_tv_stream(tmdb_id: str, season: int = 1, episode: int = 1) -> dict | None:
+    """
+    Checks if TV Episode is available on Play4U by TMDB ID, and returns the direct Play4U embed URL.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            # 1. Search Play4U by TMDB ID
+            search_resp = await client.get(
+                f"https://play4u.org/api/search.php?q={tmdb_id}&per_page=5", 
+                headers=PLAYDRIVE_HEADERS
+            )
+            item = None
+            if search_resp.status_code == 200:
+                for it in search_resp.json().get("items", []):
+                    if str(it.get("tmdb_id")) == str(tmdb_id):
+                        item = it
+                        break
+                if not item and search_resp.json().get("items"):
+                    item = search_resp.json()["items"][0]
+
+            # Fallback to TMDB external_ids if not matched directly
+            if not item:
+                try:
+                    ext_resp = await get_tmdb_data(f"tv/{tmdb_id}/external_ids")
+                    imdb_id_tmdb = None
+                    if ext_resp and hasattr(ext_resp, 'body'):
+                        meta = json.loads(ext_resp.body.decode('utf-8'))
+                        imdb_id_tmdb = meta.get("imdb_id")
+                    if imdb_id_tmdb:
+                        search_resp = await client.get(
+                            f"https://play4u.org/api/search.php?q={imdb_id_tmdb}&per_page=5", 
+                            headers=PLAYDRIVE_HEADERS
+                        )
+                        if search_resp.status_code == 200 and search_resp.json().get("items"):
+                            item = search_resp.json()["items"][0]
+                except Exception as e:
+                    logging.error(f"Error querying TMDB fallback for TV {tmdb_id}: {e}")
+
+            if not item:
+                return None
+
+            # Check available seasons/episodes from metadata
+            if item.get("series_season"):
+                try:
+                    max_season = int(item["series_season"])
+                    if int(season) > max_season:
+                        return None
+                except Exception:
+                    pass
+
+            if item.get("series_episode") and item.get("series_season"):
+                try:
+                    max_season = int(item["series_season"])
+                    max_ep = int(item["series_episode"])
+                    if int(season) == max_season and int(episode) > max_ep:
+                        return None
+                except Exception:
+                    pass
+
+            imdb_id = item.get("imdb_id")
+            s_pad = f"{int(season):02d}"
+            ep_pad = f"{int(episode):02d}"
+            target_url = f"https://play4u.org/series/{imdb_id}/s-{s_pad}/ep-{ep_pad}" if imdb_id else f"https://play4u.org{item.get('watch').rstrip('/')}/s-{s_pad}/ep-{ep_pad}"
+
+            # Verify series episode page is live on Play4U
+            page_resp = await client.get(target_url, headers=PLAYDRIVE_HEADERS)
+            if page_resp.status_code != 200:
+                return None
+
+            # Strict check: Play4U redirects non-existent seasons back to s-01/ep-01?cont=1
+            if f"s-{s_pad}/ep-{ep_pad}" not in str(page_resp.url) or "cont=1" in str(page_resp.url):
+                return None
+
+            embed_target = f"{target_url}?embed=1"
+            return {
+                "success": True,
+                "media_type": "tv",
+                "tmdb_id": tmdb_id,
+                "imdb_id": imdb_id,
+                "season": season,
+                "episode": episode,
+                "title": item.get("title"),
+                "embed_url": embed_target,
+                "stream_url": embed_target
+            }
+    except Exception as e:
+        logging.error(f"Error resolving TV stream for TMDB ID {tmdb_id} S{season}E{episode}: {e}")
+        return None
+
+
+@app.get("/proxy/stream/{media_type}/{tmdb_id}")
+@app.get("/stream/{media_type}/{tmdb_id}")
+async def resolve_stream_endpoint(
+    media_type: str,
+    tmdb_id: str,
+    season: int = 1,
+    episode: int = 1,
+    request: Request = None
+):
+    """
+    Main S0 stream resolver for Movies and TV Series.
+    Uses get_movie_stream and get_tv_stream directly in main.py.
+    """
+    if media_type == "movie":
+        res = await get_movie_stream(tmdb_id)
+    else:
+        res = await get_tv_stream(tmdb_id, season=season or 1, episode=episode or 1)
+
+    if not res or not res.get("embed_url"):
+        return {
+            "success": False,
+            "message": "Play4U stream not available. Switching to backup server...",
+            "fallback_server": 1
+        }
+
+    embed_url = res["embed_url"]
+    return {
+        "success": True,
+        "media_type": media_type,
+        "tmdb_id": tmdb_id,
+        "season": season,
+        "episode": episode,
+        "title": res.get("title"),
+        "source_id": "play4u",
+        "source_label": "S0",
+        "available_sources": ["play4u"],
+        "embed_url": embed_url,
+        "stream_url": embed_url
+    }
+
 
 @app.get("/health")
 async def health_check():

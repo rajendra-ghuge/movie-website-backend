@@ -11,6 +11,7 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -85,6 +86,9 @@ async def shutdown_event():
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Compress all responses > 1KB to minimize Render bandwidth consumption
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # CORS
 app.add_middleware(
@@ -629,9 +633,68 @@ async def resolve_stream_endpoint(
     }
 
 
+from services import serials_service
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ── TV Serials & Regional Shows API Endpoints ─────────────────────────
+@app.get("/proxy/serials/home")
+@app.get("/serials/home")
+async def get_serials_home():
+    try:
+        return await serials_service.get_home_data()
+    except Exception as e:
+        logging.error(f"Failed to fetch serials home: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch TV serials home")
+
+
+@app.get("/proxy/serials/channel/{channel_slug}")
+@app.get("/serials/channel/{channel_slug}")
+async def get_serials_channel_shows(channel_slug: str):
+    try:
+        return await serials_service.get_channel_shows(channel_slug)
+    except Exception as e:
+        logging.error(f"Failed to fetch shows for channel {channel_slug}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch shows for channel {channel_slug}")
+
+
+@app.get("/proxy/serials/shelf/{language}")
+@app.get("/serials/shelf/{language}")
+async def get_serials_shelf(language: str):
+    try:
+        return await serials_service.get_language_latest_episodes(language)
+    except Exception as e:
+        logging.error(f"Failed to fetch shelf for {language}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch shelf for {language}")
+
+
+@app.get("/proxy/serials/show")
+@app.get("/serials/show")
+async def get_serial_episodes(url: str, offset: int = 0, season: str = "1"):
+    try:
+        return await serials_service.get_show_episodes(url, offset=offset, season=season)
+    except Exception as e:
+        logging.error(f"Failed to fetch episodes for {url} (offset {offset}): {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch show episodes")
+
+
+@app.get("/proxy/serials/resolve")
+@app.get("/serials/resolve")
+async def resolve_serial_embed(url: str):
+    try:
+        data = await serials_service.resolve_episode_embed(url)
+        if not data.get("embed_url"):
+            raise HTTPException(status_code=404, detail="No video embed found for this episode")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to resolve embed for {url}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resolve episode video embed")
 
 
 def get_client_ip(request: Request) -> str:

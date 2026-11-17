@@ -6,3 +6,4 @@ slowapi
 psycopg2-binary
 cachetools
 gunicorn
+beautifulsoup4

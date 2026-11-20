@@ -19,6 +19,7 @@ from slowapi.extension import _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 
 
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
 logging.basicConfig(
@@ -147,51 +148,76 @@ async def get_now_playing_movies(request: Request):
     params = dict(request.query_params)
     return await get_tmdb_data("movie/now_playing", params)
 
+async def resolve_media_id(id_val: str | int, media_type: str = "movie") -> str:
+    s_val = str(id_val).strip()
+    if s_val.startswith("tt"):
+        try:
+            res = await get_tmdb_data(f"find/{s_val}", {"external_source": "imdb_id"})
+            if hasattr(res, "body"):
+                data = json.loads(res.body.decode("utf-8"))
+                target_key = "tv_results" if media_type == "tv" else "movie_results"
+                results = data.get(target_key, []) or data.get("movie_results", []) or data.get("tv_results", [])
+                if results and results[0].get("id"):
+                    return str(results[0]["id"])
+        except Exception:
+            pass
+    return s_val
+
 @app.get("/proxy/movie/{movie_id}")
-async def get_movie_details(movie_id: int, request: Request):
+async def get_movie_details(movie_id: str, request: Request):
+    resolved_id = await resolve_media_id(movie_id, "movie")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"movie/{movie_id}", params)
+    return await get_tmdb_data(f"movie/{resolved_id}", params)
 
 @app.get("/proxy/movie/{movie_id}/videos")
-async def get_movie_videos(movie_id: int):
-    return await get_tmdb_data(f"movie/{movie_id}/videos")
+async def get_movie_videos(movie_id: str):
+    resolved_id = await resolve_media_id(movie_id, "movie")
+    return await get_tmdb_data(f"movie/{resolved_id}/videos")
 
 @app.get("/proxy/movie/{movie_id}/credits")
-async def get_movie_credits(movie_id: int):
-    return await get_tmdb_data(f"movie/{movie_id}/credits")
+async def get_movie_credits(movie_id: str):
+    resolved_id = await resolve_media_id(movie_id, "movie")
+    return await get_tmdb_data(f"movie/{resolved_id}/credits")
 
 @app.get("/proxy/movie/{movie_id}/similar")
-async def get_movie_similar(movie_id: int, request: Request):
+async def get_movie_similar(movie_id: str, request: Request):
+    resolved_id = await resolve_media_id(movie_id, "movie")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"movie/{movie_id}/similar", params)
+    return await get_tmdb_data(f"movie/{resolved_id}/similar", params)
 
 @app.get("/proxy/movie/{movie_id}/recommendations")
-async def get_movie_recommendations(movie_id: int, request: Request):
+async def get_movie_recommendations(movie_id: str, request: Request):
+    resolved_id = await resolve_media_id(movie_id, "movie")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"movie/{movie_id}/recommendations", params)
+    return await get_tmdb_data(f"movie/{resolved_id}/recommendations", params)
 
 @app.get("/proxy/tv/{tv_id}")
-async def get_tv_details(tv_id: int, request: Request):
+async def get_tv_details(tv_id: str, request: Request):
+    resolved_id = await resolve_media_id(tv_id, "tv")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"tv/{tv_id}", params)
+    return await get_tmdb_data(f"tv/{resolved_id}", params)
 
 @app.get("/proxy/tv/{tv_id}/recommendations")
-async def get_tv_recommendations(tv_id: int, request: Request):
+async def get_tv_recommendations(tv_id: str, request: Request):
+    resolved_id = await resolve_media_id(tv_id, "tv")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"tv/{tv_id}/recommendations", params)
+    return await get_tmdb_data(f"tv/{resolved_id}/recommendations", params)
 
 @app.get("/proxy/tv/{tv_id}/season/{season_number}")
-async def get_tv_season_details(tv_id: int, season_number: int, request: Request):
+async def get_tv_season_details(tv_id: str, season_number: int, request: Request):
+    resolved_id = await resolve_media_id(tv_id, "tv")
     params = dict(request.query_params)
-    return await get_tmdb_data(f"tv/{tv_id}/season/{season_number}", params)
+    return await get_tmdb_data(f"tv/{resolved_id}/season/{season_number}", params)
 
 @app.get("/proxy/movie/{movie_id}/keywords")
-async def get_movie_keywords(movie_id: int):
-    return await get_tmdb_data(f"movie/{movie_id}/keywords")
+async def get_movie_keywords(movie_id: str):
+    resolved_id = await resolve_media_id(movie_id, "movie")
+    return await get_tmdb_data(f"movie/{resolved_id}/keywords")
 
 @app.get("/proxy/tv/{tv_id}/keywords")
-async def get_tv_keywords(tv_id: int):
-    return await get_tmdb_data(f"tv/{tv_id}/keywords")
+async def get_tv_keywords(tv_id: str):
+    resolved_id = await resolve_media_id(tv_id, "tv")
+    return await get_tmdb_data(f"tv/{resolved_id}/keywords")
 
 @app.get("/proxy/genre/{media_type}/list")
 async def get_genres(media_type: str, request: Request):
@@ -226,9 +252,7 @@ async def discover_tv(request: Request):
         params["sort_by"] = "first_air_date.desc"
     return await get_tmdb_data("discover/tv", params)
 
-@app.get("/proxy/discover/both")
-async def discover_both(request: Request):
-    params = dict(request.query_params)
+async def get_discover_both_data(params: dict):
     if "certification_country" not in params:
         params["certification_country"] = "IN"
     params["api_key"] = TMDB_API_KEY
@@ -345,6 +369,10 @@ async def discover_both(request: Request):
         if 'client' in locals() and should_close_client:
             await client.aclose()
 
+@app.get("/proxy/discover/both")
+async def discover_both(request: Request):
+    return await get_discover_both_data(dict(request.query_params))
+
 @app.get("/proxy/search/multi")
 async def search_multi(request: Request):
     params = dict(request.query_params)
@@ -359,7 +387,7 @@ async def find_by_external_id(external_id: str, request: Request):
 
 @app.get("/convert/imdb/{imdb_id}")
 async def convert_imdb_to_tmdb(imdb_id: str, season: int = 1, episode: int = 1):
-    """Converts IMDb ID to TMDB ID and returns the corresponding Play4U iframe embed URL."""
+    """Converts IMDb ID to TMDB ID and returns the corresponding PlayForU iframe embed URL."""
     res = await get_tmdb_data(f"find/{imdb_id}", {"external_source": "imdb_id"})
     if hasattr(res, "body"):
         data = json.loads(res.body.decode("utf-8"))
@@ -421,7 +449,7 @@ async def proxy_image(size: str, path: str):
     )
 
 # ==============================================================================
-# Direct Stream Resolvers (Play4U Embed for S0)
+# Direct Stream Resolvers (PlayForU Embed for S0)
 # ==============================================================================
 
 PLAYDRIVE_HEADERS = {
@@ -432,11 +460,11 @@ PLAYDRIVE_HEADERS = {
 
 async def get_movie_stream(tmdb_id: str) -> dict | None:
     """
-    Checks if Movie is available on Play4U by TMDB ID, and returns the direct Play4U embed URL.
+    Checks if Movie is available on PlayForU by TMDB ID, and returns the direct PlayForU embed URL.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            # 1. Search Play4U by TMDB ID
+            # 1. Search PlayForU by TMDB ID
             search_resp = await client.get(
                 f"https://play4u.org/api/search.php?q={tmdb_id}&per_page=5", 
                 headers=PLAYDRIVE_HEADERS
@@ -450,39 +478,13 @@ async def get_movie_stream(tmdb_id: str) -> dict | None:
                 if not item and search_resp.json().get("items"):
                     item = search_resp.json()["items"][0]
 
-            # Fallback to TMDB details if not matched directly
-            if not item:
-                try:
-                    tmdb_resp = await get_tmdb_data(f"movie/{tmdb_id}")
-                    if tmdb_resp and hasattr(tmdb_resp, 'body'):
-                        meta = json.loads(tmdb_resp.body.decode('utf-8'))
-                        imdb_id_tmdb = meta.get("imdb_id")
-                        title_tmdb = meta.get("title")
-                        if imdb_id_tmdb:
-                            search_resp = await client.get(
-                                f"https://play4u.org/api/search.php?q={imdb_id_tmdb}&per_page=5", 
-                                headers=PLAYDRIVE_HEADERS
-                            )
-                            if search_resp.status_code == 200 and search_resp.json().get("items"):
-                                item = search_resp.json()["items"][0]
-                        if not item and title_tmdb:
-                            clean_title = re.sub(r'[^a-zA-Z0-9\s]', ' ', title_tmdb).strip()
-                            search_resp = await client.get(
-                                f"https://play4u.org/api/search.php?q={clean_title}&per_page=5", 
-                                headers=PLAYDRIVE_HEADERS
-                            )
-                            if search_resp.status_code == 200 and search_resp.json().get("items"):
-                                item = search_resp.json()["items"][0]
-                except Exception as e:
-                    logging.error(f"Error querying TMDB fallback for movie {tmdb_id}: {e}")
-
             if not item:
                 return None
 
             imdb_id = item.get("imdb_id")
             target_url = f"https://play4u.org/watch/{imdb_id}" if imdb_id else f"https://play4u.org{item.get('watch')}"
 
-            # Verify watch page is live on Play4U
+            # Verify watch page is live on PlayForU
             page_resp = await client.get(target_url, headers=PLAYDRIVE_HEADERS)
             if page_resp.status_code != 200:
                 return None
@@ -504,11 +506,11 @@ async def get_movie_stream(tmdb_id: str) -> dict | None:
 
 async def get_tv_stream(tmdb_id: str, season: int = 1, episode: int = 1) -> dict | None:
     """
-    Checks if TV Episode is available on Play4U by TMDB ID, and returns the direct Play4U embed URL.
+    Checks if TV Episode is available on PlayForU by TMDB ID, and returns the direct PlayForU embed URL.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            # 1. Search Play4U by TMDB ID
+            # 1. Search PlayForU by TMDB ID
             search_resp = await client.get(
                 f"https://play4u.org/api/search.php?q={tmdb_id}&per_page=5", 
                 headers=PLAYDRIVE_HEADERS
@@ -521,24 +523,6 @@ async def get_tv_stream(tmdb_id: str, season: int = 1, episode: int = 1) -> dict
                         break
                 if not item and search_resp.json().get("items"):
                     item = search_resp.json()["items"][0]
-
-            # Fallback to TMDB external_ids if not matched directly
-            if not item:
-                try:
-                    ext_resp = await get_tmdb_data(f"tv/{tmdb_id}/external_ids")
-                    imdb_id_tmdb = None
-                    if ext_resp and hasattr(ext_resp, 'body'):
-                        meta = json.loads(ext_resp.body.decode('utf-8'))
-                        imdb_id_tmdb = meta.get("imdb_id")
-                    if imdb_id_tmdb:
-                        search_resp = await client.get(
-                            f"https://play4u.org/api/search.php?q={imdb_id_tmdb}&per_page=5", 
-                            headers=PLAYDRIVE_HEADERS
-                        )
-                        if search_resp.status_code == 200 and search_resp.json().get("items"):
-                            item = search_resp.json()["items"][0]
-                except Exception as e:
-                    logging.error(f"Error querying TMDB fallback for TV {tmdb_id}: {e}")
 
             if not item:
                 return None
@@ -566,12 +550,12 @@ async def get_tv_stream(tmdb_id: str, season: int = 1, episode: int = 1) -> dict
             ep_pad = f"{int(episode):02d}"
             target_url = f"https://play4u.org/series/{imdb_id}/s-{s_pad}/ep-{ep_pad}" if imdb_id else f"https://play4u.org{item.get('watch').rstrip('/')}/s-{s_pad}/ep-{ep_pad}"
 
-            # Verify series episode page is live on Play4U
+            # Verify series episode page is live on PlayForU
             page_resp = await client.get(target_url, headers=PLAYDRIVE_HEADERS)
             if page_resp.status_code != 200:
                 return None
 
-            # Strict check: Play4U redirects non-existent seasons back to s-01/ep-01?cont=1
+            # Strict check: PlayForU redirects non-existent seasons back to s-01/ep-01?cont=1
             if f"s-{s_pad}/ep-{ep_pad}" not in str(page_resp.url) or "cont=1" in str(page_resp.url):
                 return None
 
@@ -613,7 +597,7 @@ async def resolve_stream_endpoint(
     if not res or not res.get("embed_url"):
         return {
             "success": False,
-            "message": "Play4U stream not available. Switching to backup server...",
+            "message": "PlayForU stream not available. Switching to backup server...",
             "fallback_server": 1
         }
 
@@ -625,15 +609,58 @@ async def resolve_stream_endpoint(
         "season": season,
         "episode": episode,
         "title": res.get("title"),
-        "source_id": "play4u",
+        "source_id": "playforu",
         "source_label": "S0",
-        "available_sources": ["play4u"],
+        "available_sources": ["playforu"],
         "embed_url": embed_url,
         "stream_url": embed_url
     }
 
 
-from services import serials_service
+from services import serials_service, playforu_scraper
+
+
+# ── PlayForU Latest Scraped Catalog Endpoint ─────────────────────────
+@app.get("/proxy/playforu/latest")
+@app.get("/playforu/latest")
+async def get_playforu_latest_catalog(page: int = 1):
+    try:
+        data = await playforu_scraper.scrape_playforu_latest(
+            page=page,
+            tmdb_api_key=TMDB_API_KEY,
+            tmdb_client=tmdb_client
+        )
+        if not data or not data.get("results"):
+            # Fallback to default popular discovery feed if PlayForU UI changes or returns 0 results
+            logging.warning(f"PlayForU returned empty results on page {page}, using default home fallback")
+            today = date.today().isoformat()
+            fallback_params = {
+                "page": str(page),
+                "sort_by": "popularity.desc",
+                "with_origin_country": "IN",
+                "without_genres": "10766,10764,10767,10763",
+                "primary_release_date.lte": today,
+                "first_air_date.lte": today
+            }
+            return await get_discover_both_data(fallback_params)
+
+        return Response(
+            content=json.dumps(data),
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=300"}
+        )
+    except Exception as e:
+        logging.error(f"Failed to fetch playforu latest catalog (site down or error), using default home fallback: {e}")
+        today = date.today().isoformat()
+        fallback_params = {
+            "page": str(page),
+            "sort_by": "popularity.desc",
+            "with_origin_country": "IN",
+            "without_genres": "10766,10764,10767,10763",
+            "primary_release_date.lte": today,
+            "first_air_date.lte": today
+        }
+        return await get_discover_both_data(fallback_params)
 
 
 @app.get("/health")
